@@ -5,3 +5,4 @@ openpyxl
 nse
 streamlit-lightweight-charts-v5
 httpx[http2]
+requests
