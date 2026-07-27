@@ -240,14 +240,19 @@ with tab_white:
             vol_indicator = VolumeIndicator(chart_df, height=140)
             vol_indicator.calculate()
             vol_pane = vol_indicator.pane()
-            # Extend the volume pane with a delivery% line on its own scale -
-            # NOT visually tested in a browser from this sandbox, check the
-            # rendered result and adjust scaleMargins if it looks off.
-            dlv_records = (
-                chart_df[["date", "delivery_pct"]]
-                .rename(columns={"date": "time", "delivery_pct": "value"})
-                .to_dict(orient="records")
+            # FIX: earlier version sent raw NaN (from the rolling calc's
+            # warm-up period and any zero-volume days) straight into the
+            # JSON payload. Python's json module writes bare `NaN`, which
+            # is NOT valid JSON - the browser's strict JSON.parse rejects
+            # it with exactly the error you saw. The library's own
+            # SMAIndicator already filters this with `.notnull()` (checked
+            # its source) - my custom series never did. Fixed the same way.
+            dlv_data = chart_df[["date", "delivery_pct"]].rename(
+                columns={"date": "time", "delivery_pct": "value"}
             )
+            dlv_data = dlv_data[dlv_data["value"].notnull()]
+            dlv_records = dlv_data.to_dict(orient="records")
+
             vol_pane["series"].append({
                 "type": "Line",
                 "data": dlv_records,
