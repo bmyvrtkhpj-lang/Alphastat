@@ -27,9 +27,11 @@ from vadm_calculations import (
     calc_relative_delivery,
     calc_volume_percentile,
     calc_52wk_high_low,
-    calc_liquidity_value,
+    fetch_market_depth,
+    estimate_exit_price,
     parse_screener_excel,
     calc_pe_per_year,
+    calc_market_cap_per_year,
     calc_ev_per_year,
     calc_revenue_growth,
     fetch_promoter_holding,
@@ -57,21 +59,50 @@ def get_universe():
 
 universe = get_universe()
 
-search_col, upload_col = st.columns([2, 1])
+# Search now only fires on the button click, not on every dropdown change -
+# wrapped in st.form so picking a symbol doesn't trigger anything by itself.
+# The chosen symbol/excel are pushed into session_state on submit so that
+# later widget interactions (checkboxes, sliders inside the tabs) don't
+# clear the results - only a fresh "Search" click changes what's loaded.
+if "vadm_symbol" not in st.session_state:
+    st.session_state.vadm_symbol = None
+if "vadm_excel_bytes" not in st.session_state:
+    st.session_state.vadm_excel_bytes = None
 
-with search_col:
-    symbol = st.selectbox(
-        "🔍 Search stock",
-        options=sorted(universe.keys()),
-        index=sorted(universe.keys()).index("RELIANCE") if "RELIANCE" in universe else 0,
-        help="Type to filter. This one search feeds both Alpha White and Alpha Black tabs below.",
-    )
+with st.form("search_form"):
+    search_col, upload_col, btn_col = st.columns([2, 1, 0.6])
 
-with upload_col:
-    uploaded_excel = st.file_uploader(
-        "Screener.in export (.xlsx)", type=["xlsx"],
-        help="Single-company export, same structure as IRB_Infra_Devl-3.xlsx"
-    )
+    with search_col:
+        symbol_choice = st.selectbox(
+            "🔍 Search stock",
+            options=sorted(universe.keys()),
+            index=sorted(universe.keys()).index("RELIANCE") if "RELIANCE" in universe else 0,
+            help="Pick a symbol, then click Search. This one search feeds both tabs below.",
+        )
+
+    with upload_col:
+        excel_choice = st.file_uploader(
+            "Screener.in export (.xlsx)", type=["xlsx"],
+            help="Single-company export, same structure as IRB_Infra_Devl-3.xlsx"
+        )
+
+    with btn_col:
+        st.write("")  # vertical spacer to align button with the inputs
+        st.write("")
+        submitted = st.form_submit_button("Search", use_container_width=True)
+
+if submitted:
+    st.session_state.vadm_symbol = symbol_choice
+    # Store raw bytes, not the UploadedFile object itself - the object's
+    # read pointer doesn't survive being reused across reruns cleanly.
+    st.session_state.vadm_excel_bytes = excel_choice.getvalue() if excel_choice else None
+
+symbol = st.session_state.vadm_symbol
+uploaded_excel_bytes = st.session_state.vadm_excel_bytes
+
+if symbol is None:
+    st.info("👆 Search for a stock above to see Alpha White / Alpha Black results.")
+    st.stop()
 
 
 @st.cache_data(ttl=900)
@@ -102,8 +133,8 @@ with tab_white:
     if eod_df is None:
         st.warning("No price data loaded - pick a valid symbol.")
     else:
-        # --- Top row: CMP / 52w H-L / liquidity ---
-        col1, col2, col3, col4 = st.columns(4)
+        # --- Top row: CMP / 52w H-L ---
+        col1, col2, col3 = st.columns(3)
         cmp = eod_df["Close"].iloc[-1]
         hi52, lo52 = calc_52wk_high_low(eod_df)
 
@@ -111,31 +142,101 @@ with tab_white:
         col2.metric("52w High", f"₹{hi52:,.2f}")
         col3.metric("52w Low", f"₹{lo52:,.2f}")
 
-        liquidity_window = col4.selectbox("Liquidity window", ["6 months", "12 months"], key="liq_window")
-        months = 6 if liquidity_window == "6 months" else 12
-        liq_val = calc_liquidity_value(eod_df, months=months)
-        col4.metric(f"Liquidity ({liquidity_window})", f"₹{liq_val:,.0f} Cr-equiv")
+        st.divider()
+
+        # --- Exit Liquidity: live order book, not historical volume ---
+        # Replaces the old 6/12-month liquidity guess entirely, per your
+        # instruction. This is a live call, so it only fires on the button
+        # click - not on every rerun caused by other widgets on this page.
+        st.subheader("Exit Liquidity — Live Order Book")
         st.caption(
-            "⚠️ 'Liquidity entered' definition was never confirmed - this is "
-            "Close × Volume summed over the window, as a placeholder assumption. "
-            "Confirm this is what you meant."
+            "Shows where bid-side size actually sits right now, and estimates "
+            "your fill price if you exit into it. Untested against the live "
+            "NSE site from my end (sandboxed) - the field-name mapping is "
+            "confirmed against the package's own sample response, but not a "
+            "live call. Run it once yourself to be sure."
         )
+
+        depth_col, qty_col = st.columns([1, 1])
+        with qty_col:
+            exit_qty = st.number_input("Shares to exit", min_value=1, value=100, step=1)
+        with depth_col:
+            fetch_depth_clicked = st.button("Fetch live order book")
+
+        if fetch_depth_clicked:
+            try:
+                depth = fetch_market_depth(symbol)
+                bid_df = pd.DataFrame(depth["bids"])
+                ask_df = pd.DataFrame(depth["asks"])
+
+                bcol, acol = st.columns(2)
+                with bcol:
+                    st.markdown("**Bids (buyers)** — this is the side you sell into")
+                    st.dataframe(bid_df, use_container_width=True, hide_index=True)
+                with acol:
+                    st.markdown("**Asks (sellers)**")
+                    st.dataframe(ask_df, use_container_width=True, hide_index=True)
+
+                st.metric("Last traded price", f"₹{depth['last_price']:,.2f}" if depth['last_price'] else "N/A")
+
+                result = estimate_exit_price(depth["bids"], exit_qty)
+                if result["depth_sufficient"]:
+                    st.success(
+                        f"Estimated exit VWAP for {exit_qty} shares: "
+                        f"₹{result['estimated_vwap_price']:,.2f} "
+                        f"(fully absorbed within visible depth)"
+                    )
+                else:
+                    st.warning(
+                        f"Only {result['filled_qty']} of {exit_qty} shares fillable within "
+                        f"the visible 5-level depth (₹{result['estimated_vwap_price']:,.2f} VWAP "
+                        f"for that portion). Remaining {result['unfilled_qty']} shares would "
+                        f"go beyond what NSE's free quote shows - real fill price for those "
+                        f"would likely be worse."
+                    )
+            except Exception as e:
+                st.error(
+                    f"Live fetch failed: {e}. This code path has never been executed "
+                    f"against the real NSE site from my sandbox - if this is a field-name "
+                    f"mismatch rather than a network issue, tell me the actual error and "
+                    f"I'll fix the mapping in fetch_market_depth()."
+                )
 
         st.divider()
 
         # --- Fundamentals (only if Excel uploaded) ---
         st.subheader("Fundamentals")
-        if uploaded_excel is not None:
+        if uploaded_excel_bytes is not None:
             try:
                 with open("/tmp/_uploaded_screener.xlsx", "wb") as f:
-                    f.write(uploaded_excel.getbuffer())
+                    f.write(uploaded_excel_bytes)
                 parsed = parse_screener_excel("/tmp/_uploaded_screener.xlsx")
 
                 years = [d.year if hasattr(d, "year") else d for d in parsed["years"]]
                 pe_series = calc_pe_per_year(parsed["price"], parsed["net_profit"], parsed["adjusted_shares_cr"])
+                mcap_series = calc_market_cap_per_year(parsed["price"], parsed["adjusted_shares_cr"])
                 ev_series = calc_ev_per_year(parsed["price"], parsed["adjusted_shares_cr"],
                                               parsed["borrowings"], parsed["cash_and_bank"])
                 growth_series = calc_revenue_growth(parsed["sales"])
+
+                # --- EV snapshot, in cards, per your request - latest FY's
+                # EV and the components that build up to it (Market Cap,
+                # Total Debt, Cash & Bank), same visual style as the
+                # CMP/52w cards up top. Full year-by-year trend still sits
+                # in the table below this - cards are the quick-glance view.
+                latest_mcap = mcap_series[-1] if mcap_series and mcap_series[-1] is not None else None
+                latest_debt = parsed["borrowings"][-1] if parsed["borrowings"] else None
+                latest_cash = parsed["cash_and_bank"][-1] if parsed["cash_and_bank"] else None
+                latest_ev = ev_series[-1] if ev_series and ev_series[-1] is not None else None
+                latest_fy = years[-1] if years else "latest"
+
+                st.markdown(f"**EV Snapshot — FY{latest_fy}**")
+                ev_c1, ev_c2, ev_c3, ev_c4 = st.columns(4)
+                ev_c1.metric("Market Cap (Cr)", f"₹{latest_mcap:,.0f}" if latest_mcap is not None else "N/A")
+                ev_c2.metric("Total Debt (Cr)", f"₹{latest_debt:,.0f}" if latest_debt is not None else "N/A")
+                ev_c3.metric("Cash & Bank (Cr)", f"₹{latest_cash:,.0f}" if latest_cash is not None else "N/A")
+                ev_c4.metric("Enterprise Value (Cr)", f"₹{latest_ev:,.0f}" if latest_ev is not None else "N/A")
+                st.caption("EV = Market Cap + Total Debt − Cash & Bank (simplified, no minority interest adjustment)")
 
                 fundamentals_df = pd.DataFrame({
                     "FY": years,
