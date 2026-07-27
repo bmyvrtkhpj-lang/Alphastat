@@ -44,26 +44,34 @@ st.set_page_config(page_title="VADM", layout="wide")
 
 
 # ---------------------------------------------------------------------------
-# SIDEBAR - stock selection + fundamentals upload
+# SEARCH - one search, up top, feeds BOTH strategy tabs below.
+# Not in the sidebar anymore - this is the main flow: search once, then pick
+# a strategy tab. Both tabs read the same `symbol` / `eod_df` set here.
 # ---------------------------------------------------------------------------
+
+st.title("VADM")
 
 @st.cache_data(ttl=3600)
 def get_universe():
     return fetch_stock_universe()
 
-st.sidebar.header("VADM")
-
 universe = get_universe()
-symbol = st.sidebar.selectbox(
-    "Stock symbol",
-    options=sorted(universe.keys()),
-    index=sorted(universe.keys()).index("RELIANCE") if "RELIANCE" in universe else 0,
-)
 
-uploaded_excel = st.sidebar.file_uploader(
-    "Screener.in export (.xlsx)", type=["xlsx"],
-    help="Single-company export, same structure as IRB_Infra_Devl-3.xlsx"
-)
+search_col, upload_col = st.columns([2, 1])
+
+with search_col:
+    symbol = st.selectbox(
+        "🔍 Search stock",
+        options=sorted(universe.keys()),
+        index=sorted(universe.keys()).index("RELIANCE") if "RELIANCE" in universe else 0,
+        help="Type to filter. This one search feeds both Alpha White and Alpha Black tabs below.",
+    )
+
+with upload_col:
+    uploaded_excel = st.file_uploader(
+        "Screener.in export (.xlsx)", type=["xlsx"],
+        help="Single-company export, same structure as IRB_Infra_Devl-3.xlsx"
+    )
 
 
 @st.cache_data(ttl=900)
@@ -78,9 +86,11 @@ except Exception as e:
     data_load_error = str(e)
 
 if data_load_error:
-    st.sidebar.error(f"Could not load EOD2 data for {symbol}: {data_load_error}")
+    st.error(f"Could not load EOD2 data for {symbol}: {data_load_error}")
 
+st.divider()
 
+# Tabs sit BELOW the search, per your layout - one search, then pick strategy.
 tab_white, tab_black = st.tabs(["Alpha White", "Alpha Black"])
 
 # ---------------------------------------------------------------------------
