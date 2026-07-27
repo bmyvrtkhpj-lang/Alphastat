@@ -38,9 +38,18 @@ def fetch_stock_universe() -> dict:
     """
     Returns {symbol: isin} for ~4500 NSE-listed symbols.
     Source verified live: raw.githubusercontent.com/BennyThadikaran/eod2_data
+
+    CORRECTED: the JSON file has two top-level keys, not one flat map -
+    "sym2isin" (symbol -> isin, what we want) and "isin2hist" (isin -> list
+    of symbol-change records, e.g. renames/corporate actions - not needed
+    here). Earlier version of this function read the whole file as if it
+    were already the flat map, which put "sym2isin"/"isin2hist" themselves
+    into the stock picker as fake symbols.
     """
     url = "https://raw.githubusercontent.com/BennyThadikaran/eod2_data/main/isin_symbol_map.json"
-    return pd.read_json(url, typ="series").to_dict()
+    import requests
+    data = requests.get(url, timeout=15).json()
+    return data["sym2isin"]
 
 
 # ---------------------------------------------------------------------------
