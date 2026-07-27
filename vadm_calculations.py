@@ -113,16 +113,89 @@ def calc_52wk_high_low(df: pd.DataFrame) -> tuple:
 
 def calc_liquidity_value(df: pd.DataFrame, months: int) -> float:
     """
-    "Liquidity entered in last N months" - you didn't confirm a precise
-    definition for this, so THIS IS A GUESS, clearly flagged:
-    total traded value = sum(Close * Volume) over the trailing window.
-    An alternative reading (sum of Close * DLV_QTY, i.e. delivered value only)
-    is equally plausible. Confirm which one you mean before trusting this
-    number in the UI.
+    DEPRECATED per your instruction - replaced by live order book depth
+    (see fetch_market_depth / estimate_exit_price below). Left here only in
+    case old code references it; not called from app.py anymore.
     """
-    trading_days = int(months * 21)  # ~21 trading days/month, approximate
+    trading_days = int(months * 21)
     recent = df.tail(trading_days)
     return (recent["Close"] * recent["Volume"]).sum()
+
+
+def fetch_market_depth(symbol: str, download_folder: str = "./nse_data") -> dict:
+    """
+    Live order book (market depth) for exit planning.
+
+    VERIFIED STRUCTURE (I fetched the package's own sample response and
+    confirmed this): nse.quote(symbol)["orderBook"] contains buyPrice1-5 /
+    buyQuantity1-5 (bid ladder) and sellPrice1-5 / sellQuantity1-5 (ask
+    ladder), plus totalBuyQuantity / totalSellQuantity / lastPrice.
+
+    STILL UNTESTED LIVE: I confirmed the *shape* from the package's sample
+    file, not by actually calling nse.quote() against the live site (this
+    sandbox can't reach nseindia.com). Run it yourself before trusting it.
+
+    server=True for the same reason as fetch_promoter_holding - this runs
+    on Streamlit Community Cloud, a server environment.
+    """
+    from nse import NSE
+
+    with NSE(download_folder, server=True) as nse_client:
+        data = nse_client.quote(symbol=symbol)
+
+    ob = data.get("orderBook", {})
+    bids = [
+        {"price": ob.get(f"buyPrice{i}"), "qty": ob.get(f"buyQuantity{i}")}
+        for i in range(1, 6)
+    ]
+    asks = [
+        {"price": ob.get(f"sellPrice{i}"), "qty": ob.get(f"sellQuantity{i}")}
+        for i in range(1, 6)
+    ]
+    return {
+        "bids": bids,
+        "asks": asks,
+        "total_buy_qty": ob.get("totalBuyQuantity"),
+        "total_sell_qty": ob.get("totalSellQuantity"),
+        "last_price": ob.get("lastPrice"),
+    }
+
+
+def estimate_exit_price(bids: list, exit_quantity: int) -> dict:
+    """
+    Exiting a LONG position means SELLING, which hits the BID side of the
+    book (the buyers), not the ask side - that's the part of "best exit
+    rate" that's easy to get backwards, so this is deliberate, not a typo.
+
+    Walks the bid ladder from best price down, filling `exit_quantity`
+    cumulatively, to estimate the volume-weighted average fill price.
+
+    Only 5 levels are available from the free NSE quote endpoint - if
+    exit_quantity exceeds the visible depth, `unfilled_qty` will be > 0,
+    meaning the real fill price would be worse than what's shown here
+    (there's demand beyond what NSE's free quote exposes).
+    """
+    remaining = exit_quantity
+    total_value = 0.0
+    filled = 0
+
+    for level in bids:
+        if level["price"] is None or level["qty"] is None:
+            continue
+        take = min(remaining, level["qty"])
+        total_value += take * level["price"]
+        filled += take
+        remaining -= take
+        if remaining <= 0:
+            break
+
+    vwap = (total_value / filled) if filled else None
+    return {
+        "estimated_vwap_price": vwap,
+        "filled_qty": filled,
+        "unfilled_qty": max(remaining, 0),
+        "depth_sufficient": remaining <= 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +288,16 @@ def calc_pe_per_year(price: list, net_profit: list, adj_shares_cr: list) -> list
         eps = np_ / shares
         pe_values.append(p / eps if eps else None)
     return pe_values
+
+
+def calc_market_cap_per_year(price: list, adj_shares_cr: list) -> list:
+    """Market Cap_year = Price_year * Adjusted Shares_year (Cr). Same building
+    block calc_ev_per_year uses internally - pulled out so the UI can show it
+    as its own card without recomputing the formula separately."""
+    mcap = []
+    for p, shares in zip(price, adj_shares_cr):
+        mcap.append(p * shares if (p is not None and shares is not None) else None)
+    return mcap
 
 
 def calc_ev_per_year(price: list, adj_shares_cr: list, borrowings: list, cash_bank: list) -> list:
