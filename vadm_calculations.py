@@ -15,9 +15,13 @@ STATUS OF EACH SECTION:
                                   so this is written correctly per the documented
                                   nse.shareholding() signature but never actually
                                   executed. Run it yourself before trusting it.
-  - Alpha White sector-avg PE....INCOMPLETE ON PURPOSE. The comparison logic is
-                                  here; where sector_avg_pe itself comes from is
-                                  still an open decision (see bottom of file).
+  - Alpha White PE condition......Switched to SELF-RELATIVE (vs own historical
+                                  PE range, percentile-based, toggleable 20/80
+                                  defaults) instead of sector-average - that
+                                  data source was never resolved, so this
+                                  sidesteps it rather than waiting. Coarse
+                                  resolution caveat: only ~10 annual PE points
+                                  to percentile against (see function docstring).
   - Alpha Black / VADM_t.........NOT BUILT. Formula f() and H4 were never given -
                                   this is flagged in your own project memory as a
                                   CEO-level decision. Nothing here should be
@@ -103,6 +107,66 @@ def calc_volume_percentile(df: pd.DataFrame, lookback: int = 60) -> pd.Series:
     per our earlier agreement that lookback should be a UI toggle.
     """
     return df["Volume"].rolling(lookback).rank(pct=True) * 100
+
+
+def calc_volume_direction(df: pd.DataFrame) -> pd.Series:
+    """
+    Classifies which way each day's volume leaned using Close Location
+    Value (CLV) - where the Close sat within that day's own High-Low range.
+    Per your instruction (the "more precise" option over simple Close-vs-
+    prev-Close):
+
+        CLV = ((Close - Low) - (High - Close)) / (High - Low)
+
+    +1 = closed at the day's high (pure buying pressure)
+    -1 = closed at the day's low (pure selling pressure)
+     0 = closed at the exact midpoint
+
+    This is the standard building block behind Accumulation/Distribution-
+    style indicators - not something invented for this project, just the
+    well-known formula, applied here for your specific purpose.
+    Zero-range days (circuit-locked, High==Low) are guarded to avoid
+    divide-by-zero - they come back as NaN, correctly excluded rather than
+    silently treated as buy or sell.
+    """
+    day_range = (df["High"] - df["Low"]).replace(0, np.nan)
+    clv = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / day_range
+    return clv
+
+
+def calc_volume_regime(df: pd.DataFrame, lookback: int = 60,
+                        percentile_threshold: float = 80.0) -> dict:
+    """
+    Combines volume percentile (how unusual today's volume is vs its own
+    history) with CLV (which direction that volume leaned) into a single
+    classification for TODAY:
+
+      HEAVY_BUY  - volume above the percentile threshold AND CLV > 0
+      HEAVY_SELL - volume above the percentile threshold AND CLV < 0
+      NORMAL     - volume not unusual, or direction unclear (CLV == 0)
+
+    Returns the raw percentile/CLV values too, so the UI can show them
+    rather than just the label.
+    """
+    vol_pctile_series = calc_volume_percentile(df, lookback=lookback)
+    clv_series = calc_volume_direction(df)
+
+    current_vol_pctile = vol_pctile_series.iloc[-1]
+    current_clv = clv_series.iloc[-1]
+
+    if pd.isna(current_vol_pctile) or pd.isna(current_clv):
+        return {"regime": "INSUFFICIENT_DATA", "volume_percentile": None, "clv": None}
+
+    is_heavy = current_vol_pctile > percentile_threshold
+
+    if is_heavy and current_clv > 0:
+        regime = "HEAVY_BUY"
+    elif is_heavy and current_clv < 0:
+        regime = "HEAVY_SELL"
+    else:
+        regime = "NORMAL"
+
+    return {"regime": regime, "volume_percentile": float(current_vol_pctile), "clv": float(current_clv)}
 
 
 def calc_52wk_high_low(df: pd.DataFrame) -> tuple:
@@ -372,40 +436,87 @@ def fetch_promoter_holding(symbol: str, download_folder: str = "./nse_data") -> 
 
 # ---------------------------------------------------------------------------
 # 6. ALPHA WHITE SIGNAL LOGIC
-#    The comparison itself is complete. Where sector_avg_pe comes from is
-#    still open - see note at bottom of file.
+#    PE side now self-relative (vs own history), not sector-relative -
+#    sidesteps the sector-data-source problem instead of waiting on it.
 # ---------------------------------------------------------------------------
 
-def alpha_white_signal(stock_pe: float, sector_avg_pe: float,
-                        current_volume_percentile: float,
-                        volume_percentile_threshold: float = 80.0) -> str:
+def calc_current_pe(cmp: float, latest_net_profit_cr: float, latest_adj_shares_cr: float):
     """
-    Buy: PE < sector average PE  AND  Volume percentile > threshold
-    Sell: otherwise
-    (Your confirmed definition from earlier in this project.)
+    "Current PE" - today's LIVE market price divided by the most recent
+    annual EPS available. Not a true TTM PE (no quarterly EPS wired in yet),
+    so this can lag if results have moved a lot since the last annual report -
+    a common simplification, not a precise trailing-twelve-month figure.
+    """
+    if latest_net_profit_cr in (None, 0) or latest_adj_shares_cr in (None, 0):
+        return None
+    eps = latest_net_profit_cr / latest_adj_shares_cr
+    return cmp / eps if eps else None
 
-    sector_avg_pe has no resolved data source yet (see below) - caller must
-    supply it; this function does not fetch or guess it.
+
+def calc_relative_pe_regime(current_pe, historical_pe_series: list,
+                             low_percentile: float = 20, high_percentile: float = 80) -> dict:
     """
-    if stock_pe is None or sector_avg_pe is None or current_volume_percentile is None:
+    "Relative PE" per your instruction - NOT vs sector (that data source was
+    never resolved), but vs the stock's OWN historical PE range. Same
+    self-relative logic as the volume percentile toggle, thresholds
+    adjustable, default 20/80 as you specified.
+
+    CAVEAT, flagged plainly: your screener export gives ~10 annual PE
+    points only. A percentile off 10 points is coarse - each percentile
+    step covers roughly one data point, not a smooth distribution. This
+    works but is low-resolution. A sharper version would need a daily PE
+    series (rolling TTM EPS from quarterly results, e.g. via
+    nse.results_comparison() - untested from this sandbox) - bigger scope,
+    not built here unless you want it.
+    """
+    clean_hist = [p for p in historical_pe_series if p is not None]
+    if not clean_hist or current_pe is None:
+        return {"regime": "INSUFFICIENT_DATA", "low_threshold": None, "high_threshold": None}
+
+    low_thresh = float(np.percentile(clean_hist, low_percentile))
+    high_thresh = float(np.percentile(clean_hist, high_percentile))
+
+    if current_pe < low_thresh:
+        regime = "LOW"
+    elif current_pe > high_thresh:
+        regime = "HIGH"
+    else:
+        regime = "NEUTRAL"
+
+    return {"regime": regime, "low_threshold": low_thresh, "high_threshold": high_thresh}
+
+
+def alpha_white_signal(pe_regime: str, volume_regime: str) -> str:
+    """
+    UPDATED per your clarification - this is the real definition now:
+
+      BUY:  PE regime LOW   AND  Volume regime HEAVY_BUY
+      SELL: PE regime HIGH  AND  Volume regime HEAVY_SELL
+      HOLD: everything else - PE NEUTRAL, or PE/Volume direction mismatched
+            (e.g. PE cheap but volume is HEAVY_SELL, or PE expensive but
+            volume is HEAVY_BUY). You explicitly confirmed this should NOT
+            be binary BUY/SELL anymore - HOLD is a real third state.
+
+    Kept separate from INSUFFICIENT_DATA, which means we're missing the
+    data to judge at all (different from "judged, and it's a hold").
+    """
+    if pe_regime in (None, "INSUFFICIENT_DATA") or volume_regime in (None, "INSUFFICIENT_DATA"):
         return "INSUFFICIENT_DATA"
 
-    pe_low = stock_pe < sector_avg_pe
-    volume_high = current_volume_percentile > volume_percentile_threshold
-
-    return "BUY" if (pe_low and volume_high) else "SELL"
+    if pe_regime == "LOW" and volume_regime == "HEAVY_BUY":
+        return "BUY"
+    if pe_regime == "HIGH" and volume_regime == "HEAVY_SELL":
+        return "SELL"
+    return "HOLD"
 
 
 # ---------------------------------------------------------------------------
 # STILL OPEN - NOT BUILT, NOT GUESSED:
 #
-# 1. sector_avg_pe data source. After the Excel turned out to be a
-#    single-company export with no Industry/Sector column, this reverted to
-#    an unresolved question. Options still on the table from earlier in this
-#    conversation: (a) a manual stock->sector mapping table you maintain,
-#    (b) NSE sectoral index PE via a library, if you want to revisit that.
-#    Pick one before Alpha White can run end-to-end.
-#
-# 2. Alpha Black / VADM_t. No formula f(), no H4. Your own project memory
+# 1. Alpha Black / VADM_t. No formula f(), no H4. Your own project memory
 #    flags this explicitly as a CEO-level decision - nothing here invents it.
+#
+# (Sector-relative PE is no longer blocking anything - Alpha White's PE
+# condition was switched to self-relative, per your latest instruction,
+# instead of waiting on a sector data source that was never resolved.)
 # ---------------------------------------------------------------------------
