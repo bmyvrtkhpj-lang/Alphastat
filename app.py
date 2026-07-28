@@ -40,6 +40,9 @@ from vadm_calculations import (
     calc_revenue_growth,
     fetch_promoter_holding,
     alpha_white_signal,
+    run_alpha_white_backtest,
+    summarize_backtest_signals,
+    build_signal_markers,
 )
 
 from lightweight_charts_v5 import lightweight_charts_v5_component
@@ -354,6 +357,62 @@ with tab_white:
 
         st.divider()
 
+        # --- Backtest ---
+        st.subheader("Backtest")
+        st.caption(
+            "Runs the same signal logic across full price history - zero lookahead "
+            "bias: PE percentile thresholds only ever use FY data that would have "
+            "actually been known/reported as of each historical date, never future "
+            "data. See run_alpha_white_backtest()'s docstring for the exact mechanism."
+        )
+
+        if "vadm_backtest" not in st.session_state:
+            st.session_state.vadm_backtest = None
+
+        holding_days = st.slider("Forward-return holding period (trading days)", 5, 60, 20)
+
+        if st.button("Run Backtest"):
+            if not pe_series:
+                st.warning("Upload the Screener Excel above first - backtest needs the annual PE history.")
+            else:
+                bt_df = run_alpha_white_backtest(
+                    eod_df, parsed["years"], parsed["price"], parsed["net_profit"], parsed["adjusted_shares_cr"],
+                    volume_lookback=volume_lookback, volume_pctile_threshold=volume_pctile_threshold,
+                    pe_low_pctile=pe_low_pctile, pe_high_pctile=pe_high_pctile,
+                )
+                summary_df = summarize_backtest_signals(bt_df, holding_days=holding_days)
+                st.session_state.vadm_backtest = {"bt_df": bt_df, "summary_df": summary_df}
+
+        chart_markers = []
+        if st.session_state.vadm_backtest is not None:
+            bt_df = st.session_state.vadm_backtest["bt_df"]
+            summary_df = st.session_state.vadm_backtest["summary_df"]
+
+            counts = bt_df["signal"].value_counts()
+            bt_c1, bt_c2, bt_c3, bt_c4 = st.columns(4)
+            bt_c1.metric("BUY signals", int(counts.get("BUY", 0)))
+            bt_c2.metric("SELL signals", int(counts.get("SELL", 0)))
+            bt_c3.metric("HOLD days", int(counts.get("HOLD", 0)))
+
+            if not summary_df.empty:
+                avg_by_signal = summary_df.groupby("signal")["forward_return_pct"].mean()
+                buy_avg = avg_by_signal.get("BUY")
+                bt_c4.metric(
+                    f"Avg return after BUY ({holding_days}d)",
+                    f"{buy_avg:+.2f}%" if buy_avg is not None else "N/A"
+                )
+                st.caption(
+                    "This is the ACTUAL historical result, shown as-is even if it doesn't "
+                    "flatter the strategy - real forward returns, not a curated summary."
+                )
+                st.dataframe(summary_df, use_container_width=True)
+            else:
+                st.info("No BUY/SELL signals fired historically with these settings.")
+
+            chart_markers = build_signal_markers(summary_df)
+
+        st.divider()
+
         # --- Chart ---
         st.subheader("Chart")
 
@@ -380,7 +439,8 @@ with tab_white:
             ]
 
         price_indicator = PriceIndicator(
-            chart_df, height=450, title=f"{symbol}", style="Candlestick", overlays=overlays,
+            chart_df, height=450, title=f"{symbol}", style="Candlestick",
+            overlays=overlays, markers=chart_markers,
         )
         price_indicator.calculate()
         indicators = [price_indicator]
