@@ -23,6 +23,7 @@ import streamlit as st
 
 from vadm_calculations import (
     fetch_stock_universe,
+    check_symbol_status,
     load_eod2_data,
     calc_delivery_pct,
     calc_relative_delivery,
@@ -121,6 +122,15 @@ except Exception as e:
 
 if data_load_error:
     st.error(f"Could not load EOD2 data for {symbol}: {data_load_error}")
+    # Symbol exists in the universe but has no current daily file - usually
+    # means it's delisted/merged/renamed. Check its own history record
+    # instead of leaving just the raw HTTP error.
+    try:
+        status = check_symbol_status(symbol)
+        if status["found"]:
+            st.info(status["message"])
+    except Exception:
+        pass  # best-effort explanation only - don't let this itself crash the app
 
 st.divider()
 
