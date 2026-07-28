@@ -111,17 +111,6 @@ def calc_52wk_high_low(df: pd.DataFrame) -> tuple:
     return recent["High"].max(), recent["Low"].min()
 
 
-def calc_liquidity_value(df: pd.DataFrame, months: int) -> float:
-    """
-    DEPRECATED per your instruction - replaced by live order book depth
-    (see fetch_market_depth / estimate_exit_price below). Left here only in
-    case old code references it; not called from app.py anymore.
-    """
-    trading_days = int(months * 21)
-    recent = df.tail(trading_days)
-    return (recent["Close"] * recent["Volume"]).sum()
-
-
 def fetch_market_depth(symbol: str, download_folder: str = "./nse_data") -> dict:
     """
     Live order book (market depth) for exit planning.
