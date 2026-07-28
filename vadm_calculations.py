@@ -553,6 +553,165 @@ def alpha_white_signal(pe_regime: str, volume_regime: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 7. BACKTEST - runs the Alpha White signal across full price history,
+#    with zero lookahead bias in the PE percentile thresholds.
+# ---------------------------------------------------------------------------
+
+def run_alpha_white_backtest(eod_df: pd.DataFrame, fy_dates: list, fy_price: list,
+                              fy_net_profit: list, fy_adj_shares: list,
+                              volume_lookback: int = 60, volume_pctile_threshold: float = 80.0,
+                              pe_low_pctile: float = 20, pe_high_pctile: float = 80,
+                              reporting_lag_days: int = 60, min_history_points: int = 3) -> pd.DataFrame:
+    """
+    Runs Alpha White's BUY/SELL/HOLD signal across every day in eod_df,
+    with NO LOOKAHEAD BIAS - per your explicit requirement.
+
+    How the no-lookahead guarantee works:
+      - Each FY's EPS is only treated as "known" starting reporting_lag_days
+        AFTER its FY-end date (default 60 days) - NOT the FY-end date itself.
+        FLAGGED ASSUMPTION: Screener's Data Sheet only gives FY-END dates,
+        not actual results-announcement dates. Most Indian companies report
+        annual results roughly 1-2 months after FY end, so 60 days is a
+        conservative buffer against using EPS before it was plausibly
+        public. If you know the real announcement dates, this should use
+        those instead - ask if you want that precision.
+      - On any given day, the PE percentile thresholds (20th/80th) are
+        computed ONLY from FY-end PE values that were already "known" as of
+        that day - never using a threshold informed by future PE data.
+      - Volume regime (percentile + CLV) was ALREADY point-in-time safe
+        (rolling calculations) - no change needed there.
+      - Days before `min_history_points` annual PE values have become
+        available return INSUFFICIENT_DATA rather than a meaningless
+        percentile off 1-2 data points.
+
+    Returns a DataFrame: Date, Close, Volume, current_pe, pe_low_threshold,
+    pe_high_threshold, pe_regime, volume_percentile, clv, volume_regime, signal
+    - one row per trading day, so you can see exactly how the stock was
+      moving and what volume looked like at every point, not just on
+      signal days.
+    """
+    # Per-FY EPS + own annual PE (the "population" for future percentiles)
+    annual_pe = calc_pe_per_year(fy_price, fy_net_profit, fy_adj_shares)
+    fy_eps = [
+        (npft / sh) if (npft not in (None, 0) and sh not in (None, 0)) else None
+        for npft, sh in zip(fy_net_profit, fy_adj_shares)
+    ]
+
+    fy_frame = pd.DataFrame({
+        "fy_end": pd.to_datetime(fy_dates),
+        "eps": fy_eps,
+        "annual_pe": annual_pe,
+    }).dropna(subset=["eps"]).sort_values("fy_end").reset_index(drop=True)
+    fy_frame["available_date"] = fy_frame["fy_end"] + pd.Timedelta(days=reporting_lag_days)
+
+    daily = eod_df[["Date", "Close", "High", "Low", "Volume"]].copy().sort_values("Date").reset_index(drop=True)
+
+    # merge_asof: for each trading day, attach the most recently AVAILABLE
+    # EPS as of that day (backward-looking only - this is the crux of the
+    # no-lookahead guarantee for the PE numerator).
+    eps_lookup = fy_frame[["available_date", "eps"]].rename(columns={"available_date": "Date"})
+    merged = pd.merge_asof(daily, eps_lookup, on="Date", direction="backward")
+    merged["current_pe"] = merged["Close"] / merged["eps"]
+
+    # Percentile thresholds: expanding population of annual PE values,
+    # only using ones already "available" as of each date - looped over
+    # FY boundaries (only ~10 iterations), NOT over every daily row, so
+    # this stays fast.
+    merged["pe_low_threshold"] = np.nan
+    merged["pe_high_threshold"] = np.nan
+
+    fy_avail = fy_frame.dropna(subset=["annual_pe"]).sort_values("available_date").reset_index(drop=True)
+    for i in range(len(fy_avail)):
+        cutoff = fy_avail.loc[i, "available_date"]
+        pe_population = fy_avail.loc[:i, "annual_pe"].dropna().tolist()
+        mask = merged["Date"] >= cutoff
+        if i + 1 < len(fy_avail):
+            mask &= merged["Date"] < fy_avail.loc[i + 1, "available_date"]
+        if len(pe_population) >= min_history_points:
+            merged.loc[mask, "pe_low_threshold"] = float(np.percentile(pe_population, pe_low_pctile))
+            merged.loc[mask, "pe_high_threshold"] = float(np.percentile(pe_population, pe_high_pctile))
+
+    def _pe_regime(row):
+        if pd.isna(row["pe_low_threshold"]) or pd.isna(row["current_pe"]):
+            return "INSUFFICIENT_DATA"
+        if row["current_pe"] < row["pe_low_threshold"]:
+            return "LOW"
+        if row["current_pe"] > row["pe_high_threshold"]:
+            return "HIGH"
+        return "NEUTRAL"
+
+    merged["pe_regime"] = merged.apply(_pe_regime, axis=1)
+
+    # Volume regime - reuse the already-rolling, already-safe functions.
+    eod_sorted = eod_df.sort_values("Date").reset_index(drop=True)
+    merged["volume_percentile"] = calc_volume_percentile(eod_sorted, lookback=volume_lookback).values
+    merged["clv"] = calc_volume_direction(eod_sorted).values
+
+    def _volume_regime(row):
+        if pd.isna(row["volume_percentile"]) or pd.isna(row["clv"]):
+            return "INSUFFICIENT_DATA"
+        is_heavy = row["volume_percentile"] > volume_pctile_threshold
+        if is_heavy and row["clv"] > 0:
+            return "HEAVY_BUY"
+        if is_heavy and row["clv"] < 0:
+            return "HEAVY_SELL"
+        return "NORMAL"
+
+    merged["volume_regime"] = merged.apply(_volume_regime, axis=1)
+    merged["signal"] = [alpha_white_signal(pe, vol) for pe, vol in
+                         zip(merged["pe_regime"], merged["volume_regime"])]
+
+    return merged[["Date", "Close", "Volume", "current_pe", "pe_low_threshold", "pe_high_threshold",
+                    "pe_regime", "volume_percentile", "clv", "volume_regime", "signal"]]
+
+
+def summarize_backtest_signals(backtest_df: pd.DataFrame, holding_days: int = 20) -> pd.DataFrame:
+    """
+    For every BUY/SELL day the backtest found, computes what ACTUALLY
+    happened to price over the next `holding_days` trading days - per your
+    instruction to see real results, not just signal counts.
+    Rows near the very end of the data (not enough future days left) get
+    forward_return_pct = None rather than a wrong number.
+    """
+    df = backtest_df.reset_index(drop=True)
+    signal_rows = df[df["signal"].isin(["BUY", "SELL"])].copy()
+
+    forward_returns = []
+    for idx in signal_rows.index:
+        entry_price = df.loc[idx, "Close"]
+        exit_idx = idx + holding_days
+        if exit_idx < len(df):
+            exit_price = df.loc[exit_idx, "Close"]
+            forward_returns.append((exit_price - entry_price) / entry_price * 100)
+        else:
+            forward_returns.append(None)
+
+    signal_rows["forward_return_pct"] = forward_returns
+    return signal_rows[["Date", "Close", "signal", "pe_regime", "volume_regime", "forward_return_pct"]]
+
+
+def build_signal_markers(signal_rows_df: pd.DataFrame) -> list:
+    """
+    Converts backtest signal rows into the marker format the chart package
+    expects (confirmed from its own source): time/position/color/shape/text.
+    Feed the output straight into PriceIndicator(markers=...).
+    """
+    markers = []
+    for _, row in signal_rows_df.iterrows():
+        if row["signal"] == "BUY":
+            markers.append({
+                "time": row["Date"].strftime("%Y-%m-%d") if hasattr(row["Date"], "strftime") else str(row["Date"]),
+                "position": "belowBar", "color": "#26a69a", "shape": "arrowUp", "text": "BUY",
+            })
+        elif row["signal"] == "SELL":
+            markers.append({
+                "time": row["Date"].strftime("%Y-%m-%d") if hasattr(row["Date"], "strftime") else str(row["Date"]),
+                "position": "aboveBar", "color": "#ef5350", "shape": "arrowDown", "text": "SELL",
+            })
+    return markers
+
+
+# ---------------------------------------------------------------------------
 # STILL OPEN - NOT BUILT, NOT GUESSED:
 #
 # 1. Alpha Black / VADM_t. No formula f(), no H4. Your own project memory
