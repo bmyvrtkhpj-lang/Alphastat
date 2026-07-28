@@ -5,15 +5,16 @@ Built from vadm_calculations.py. UI layer only - all math lives in the
 calc module, per our calc-layer/UI-layer split.
 
 WHAT WORKS END TO END: EOD2 fetch, delivery %, chart with toggleable
-indicators, screener Excel parsing + fundamentals + PE/EV per year.
+indicators, screener Excel parsing + fundamentals + PE/EV per year,
+self-relative PE regime signal, live order-book exit liquidity.
 
 WHAT'S INTENTIONALLY INCOMPLETE (see inline notes, not hidden):
-  - sector_avg_pe is a manual number input for now - no resolved automatic
-    source yet.
   - Promoter holding fetch is wired in but wrapped in try/except since it's
     never been executed against the live NSE site from this environment.
+  - Exit-liquidity order book fetch: same - untested against live NSE.
   - Alpha Black tab is a stub - no formula/H4 to build against yet.
-  - "Liquidity entered" metric is explicitly labeled as an assumption.
+  - PE regime is self-relative (vs own ~10 annual data points), not
+    sector-relative - coarse by nature, flagged in calc_relative_pe_regime().
 """
 
 import numpy as np
@@ -25,12 +26,14 @@ from vadm_calculations import (
     load_eod2_data,
     calc_delivery_pct,
     calc_relative_delivery,
-    calc_volume_percentile,
+    calc_volume_regime,
     calc_52wk_high_low,
     fetch_market_depth,
     estimate_exit_price,
     parse_screener_excel,
     calc_pe_per_year,
+    calc_current_pe,
+    calc_relative_pe_regime,
     calc_market_cap_per_year,
     calc_ev_per_year,
     calc_revenue_growth,
@@ -245,12 +248,17 @@ with tab_white:
                     "Net Profit (Cr)": parsed["net_profit"],
                     "Total Debt / Borrowings (Cr)": parsed["borrowings"],
                     "Cash & Bank (Cr)": parsed["cash_and_bank"],
-                    "PE": [round(p, 2) if p is not None else None for p in pe_series],
+                    "PE (FY-end)": [round(p, 2) if p is not None else None for p in pe_series],
                     "EV (Cr)": [round(e, 2) if e is not None else None for e in ev_series],
                 })
                 st.dataframe(fundamentals_df, use_container_width=True)
 
-                current_pe = pe_series[-1] if pe_series and pe_series[-1] is not None else None
+                # LIVE current PE - today's CMP over latest annual EPS, NOT
+                # the same as the FY-end PE column above (that uses the
+                # stale FY-end price). This is what feeds the signal below.
+                live_current_pe = calc_current_pe(
+                    cmp, parsed["net_profit"][-1], parsed["adjusted_shares_cr"][-1]
+                )
 
                 # Promoter holding - untested against live NSE from this sandbox
                 st.markdown("**Promoter Holding**")
@@ -266,43 +274,73 @@ with tab_white:
 
             except Exception as e:
                 st.error(f"Couldn't parse the uploaded Excel: {e}")
-                current_pe = None
+                pe_series, live_current_pe = [], None
         else:
             st.info("Upload a Screener.in export to see fundamentals + PE history.")
-            current_pe = None
+            pe_series, live_current_pe = [], None
 
         st.divider()
 
         # --- Alpha White signal ---
         st.subheader("Signal")
+
+        st.metric("Current PE (live CMP ÷ latest annual EPS)",
+                   f"{live_current_pe:.2f}" if live_current_pe is not None else "N/A - upload Excel")
+
         sig_col1, sig_col2, sig_col3 = st.columns(3)
 
-        stock_pe_input = sig_col1.number_input(
-            "Stock PE", value=float(current_pe) if current_pe else 0.0, step=0.1
+        pe_low_pctile = sig_col1.slider(
+            "PE 'low' percentile (relative to own history)", 1, 49, 20
         )
-        sector_avg_pe_input = sig_col2.number_input(
-            "Sector avg PE (manual entry - no auto source yet)", value=0.0, step=0.1
+        pe_high_pctile = sig_col2.slider(
+            "PE 'high' percentile (relative to own history)", 51, 99, 80
         )
         volume_lookback = sig_col3.slider("Volume percentile lookback (days)", 20, 252, 60)
+
         volume_pctile_threshold = st.slider(
             "Volume percentile threshold (starting hypothesis - backtest to tune)", 50, 99, 80
         )
 
-        current_vol_pctile = calc_volume_percentile(eod_df, lookback=volume_lookback).iloc[-1]
+        pe_regime_result = calc_relative_pe_regime(
+            live_current_pe, pe_series, low_percentile=pe_low_pctile, high_percentile=pe_high_pctile
+        )
+        volume_regime_result = calc_volume_regime(
+            eod_df, lookback=volume_lookback, percentile_threshold=volume_pctile_threshold
+        )
+
+        if pe_regime_result["regime"] != "INSUFFICIENT_DATA":
+            st.caption(
+                f"PE regime: **{pe_regime_result['regime']}** "
+                f"(low threshold ₹{pe_regime_result['low_threshold']:.1f}, "
+                f"high threshold ₹{pe_regime_result['high_threshold']:.1f}, "
+                f"current ₹{live_current_pe:.1f}) — based on only ~{len(pe_series)} annual "
+                f"data points, coarse by nature."
+            )
+        if volume_regime_result["regime"] != "INSUFFICIENT_DATA":
+            st.caption(
+                f"Volume regime: **{volume_regime_result['regime']}** "
+                f"(percentile {volume_regime_result['volume_percentile']:.1f}, "
+                f"CLV {volume_regime_result['clv']:+.2f} — positive means closed "
+                f"nearer the day's high, negative nearer the day's low)"
+            )
 
         signal = alpha_white_signal(
-            stock_pe=stock_pe_input if stock_pe_input else None,
-            sector_avg_pe=sector_avg_pe_input if sector_avg_pe_input else None,
-            current_volume_percentile=current_vol_pctile,
-            volume_percentile_threshold=volume_pctile_threshold,
+            pe_regime=pe_regime_result["regime"],
+            volume_regime=volume_regime_result["regime"],
         )
 
         if signal == "BUY":
-            st.success(f"Signal: **BUY** (current volume percentile: {current_vol_pctile:.1f})")
+            st.success("Signal: **BUY** (PE cheap + heavy buy-side volume)")
         elif signal == "SELL":
-            st.error(f"Signal: **SELL** (current volume percentile: {current_vol_pctile:.1f})")
+            st.error("Signal: **SELL** (PE expensive + heavy sell-side volume)")
+        elif signal == "HOLD":
+            st.info(
+                f"Signal: **HOLD** - PE regime is {pe_regime_result['regime']}, "
+                f"Volume regime is {volume_regime_result['regime']}; conditions "
+                f"for BUY or SELL aren't both met."
+            )
         else:
-            st.warning("Signal: insufficient data - enter Stock PE and Sector avg PE above.")
+            st.warning("Signal: insufficient data - upload the Screener Excel above to compute PE regime.")
 
         st.divider()
 
