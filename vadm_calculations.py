@@ -49,11 +49,53 @@ def fetch_stock_universe() -> dict:
     here). Earlier version of this function read the whole file as if it
     were already the flat map, which put "sym2isin"/"isin2hist" themselves
     into the stock picker as fake symbols.
+
+    NOTE: this universe includes symbols NSE has EVER had, including
+    delisted/merged ones (e.g. HDFC, merged into HDFCBANK in 2023) - picking
+    one of those will 404 in load_eod2_data(). Use check_symbol_status()
+    below to explain why, using the isin2hist data this same file provides.
     """
     url = "https://raw.githubusercontent.com/BennyThadikaran/eod2_data/main/isin_symbol_map.json"
     import requests
     data = requests.get(url, timeout=15).json()
     return data["sym2isin"]
+
+
+def check_symbol_status(symbol: str) -> dict:
+    """
+    Looks up a symbol's own history record (from_date/to_date/action) using
+    the same isin_symbol_map.json data fetch_stock_universe() reads, so we
+    can explain a 404 instead of just showing a raw HTTP error - e.g.
+    "HDFC" merged into HDFCBANK on 2023-07-12, confirmed via this exact
+    lookup (from_date 2011-06-22, to_date 2023-07-12, action: None -
+    NSE's own record doesn't always fill in 'action' even for known
+    mergers, so we can confirm the stop-date but not always the reason).
+    """
+    import requests
+    url = "https://raw.githubusercontent.com/BennyThadikaran/eod2_data/main/isin_symbol_map.json"
+    data = requests.get(url, timeout=15).json()
+
+    isin = data["sym2isin"].get(symbol)
+    if isin is None:
+        return {"found": False, "message": f"'{symbol}' isn't in the known NSE symbol list at all."}
+
+    history = data["isin2hist"].get(isin, [])
+    if not history:
+        return {"found": True, "history": [], "message": "No history record found - unclear why the data fetch failed."}
+
+    latest = history[0]
+    return {
+        "found": True,
+        "history": history,
+        "from_date": latest.get("from_date"),
+        "to_date": latest.get("to_date"),
+        "action": latest.get("action"),
+        "message": (
+            f"'{symbol}' was active from {latest.get('from_date')} to {latest.get('to_date')}. "
+            f"If that end date is in the past, it likely stopped trading under this symbol "
+            f"(delisting, merger, or rename) - search for a successor symbol if applicable."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
