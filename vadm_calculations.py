@@ -1174,6 +1174,47 @@ def build_sector_mapping(index_list: list, download_folder: str = "./nse_data",
     return {"mapping": symbol_to_sector, "failures": failures}
 
 
+def build_sector_mapping_yfinance(symbols: list, delay_between_calls: float = 0.5) -> dict:
+    """
+    FALLBACK sector-mapping source using yfinance's Ticker.info sector/
+    industry fields - per your question, since the NSE-index approach hit
+    a ReadTimeout on Streamlit Cloud.
+
+    HONEST TRACK RECORD, not hidden: yfinance's .info sector/industry
+    fields have a documented history (GitHub issues, 2022-2025) of
+    silently going missing or breaking across version updates. This isn't
+    guaranteed reliable either - it's offered as something cheap to TEST
+    empirically for your specific stocks, not a confirmed-good replacement.
+
+    Symbols need the .NS suffix for NSE stocks in yfinance's convention -
+    added automatically here.
+
+    delay_between_calls: small pause between requests to reduce the chance
+    of Yahoo's own rate-limiting - same defensive instinct as the NSE retry
+    logic, adjust if you see rate-limit errors.
+    """
+    import time
+    import yfinance as yf
+
+    symbol_to_sector = {}
+    failures = []
+
+    for symbol in symbols:
+        try:
+            ticker = yf.Ticker(f"{symbol}.NS")
+            info = ticker.info
+            sector = info.get("sector")
+            if sector:
+                symbol_to_sector[symbol] = sector
+            else:
+                failures.append((symbol, "sector field empty/missing in .info - the known yfinance issue"))
+        except Exception as e:
+            failures.append((symbol, str(e)))
+        time.sleep(delay_between_calls)
+
+    return {"mapping": symbol_to_sector, "failures": failures}
+
+
 def calc_valuation_score_V(panel_df: pd.DataFrame, lookback_days: int = 365,
                             min_population: int = 10) -> pd.DataFrame:
     """
