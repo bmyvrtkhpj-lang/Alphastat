@@ -1115,7 +1115,8 @@ CANDIDATE_SECTORAL_INDICES = [
 ]
 
 
-def build_sector_mapping(index_list: list, download_folder: str = "./nse_data") -> dict:
+def build_sector_mapping(index_list: list, download_folder: str = "./nse_data",
+                          timeout: int = 45, max_retries: int = 3, retry_delay: float = 3.0) -> dict:
     """
     Builds symbol -> sector using NSE's own sectoral indices as the sector
     proxy - your explicit choice, revisiting the idea from earlier in this
@@ -1128,31 +1129,47 @@ def build_sector_mapping(index_list: list, download_folder: str = "./nse_data") 
     own "Acceptable values for nse.listEquityStocksByIndex" docs section
     for the definitive list before relying on this one.
 
-    UNTESTED - same network restriction as everything else touching NSE
-    directly (promoter holding, order book) - this sandbox can't reach
-    nseindia.com. Written correctly per the documented method signature,
-    verify in your own environment first.
+    TIMEOUT/RETRY, added after a real ReadTimeout on Streamlit Cloud:
+    NSE's website is known to respond slowly (or challenge) requests from
+    cloud-provider IPs (AWS/GCP/Azure, which is what Streamlit Cloud runs
+    on) - this isn't a hard block, just slow, so a longer timeout (45s
+    default, up from the package's own 15s default) plus a few retries
+    with a short delay between attempts should get past transient timeouts.
+    If it STILL fails after max_retries, that's a stronger signal NSE may
+    be deliberately rate-limiting/blocking this specific cloud IP range,
+    which retries alone won't fix - would need a different approach
+    (e.g. a proxy, or running this fetch from a non-cloud IP once and
+    reusing the result).
 
     A stock present in multiple sectoral indices will end up mapped to
     whichever index is processed LAST in index_list - if that matters to
     you, order index_list accordingly or handle multi-sector stocks
     explicitly, this doesn't resolve that for you.
     """
+    import time
     from nse import NSE
 
     symbol_to_sector = {}
     failures = []
 
-    with NSE(download_folder, server=True) as nse_client:
+    with NSE(download_folder, server=True, timeout=timeout) as nse_client:
         for index_name in index_list:
-            try:
-                result = nse_client.listEquityStocksByIndex(index=index_name)
-                for stock in result.get("data", []):
-                    sym = stock.get("symbol")
-                    if sym:
-                        symbol_to_sector[sym] = index_name
-            except Exception as e:
-                failures.append((index_name, str(e)))
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    result = nse_client.listEquityStocksByIndex(index=index_name)
+                    for stock in result.get("data", []):
+                        sym = stock.get("symbol")
+                        if sym:
+                            symbol_to_sector[sym] = index_name
+                    last_error = None
+                    break  # success, stop retrying this index
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries:
+                        time.sleep(retry_delay)
+            if last_error is not None:
+                failures.append((index_name, f"{last_error} (failed after {max_retries} attempts)"))
 
     return {"mapping": symbol_to_sector, "failures": failures}
 
