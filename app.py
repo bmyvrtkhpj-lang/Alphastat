@@ -32,6 +32,7 @@ from vadm_calculations import (
     fetch_market_depth,
     estimate_exit_price,
     parse_screener_excel,
+    parse_multiple_screener_excels,
     calc_pe_per_year,
     calc_current_pe,
     calc_relative_pe_regime,
@@ -637,6 +638,42 @@ with tab_black:
             name=f"{symbol}_black", charts=[black_price_indicator.pane()], height=400,
             key=f"black_chart_{symbol}",
         )
+
+    st.divider()
+    st.subheader("Multi-Stock Screener Upload (for sector-grouped fitting)")
+    st.caption(
+        "Upload multiple stocks' Screener.in exports at once - needed for real "
+        "VADM_t Betas (sector-grouped regression needs many stocks per sector). "
+        "IMPORTANT: name each file with the stock's exact NSE symbol before "
+        "uploading (e.g., RELIANCE.xlsx, TCS.xlsx) - the symbol is read from "
+        "the filename, not guessed from the file's content."
+    )
+
+    if "vadm_multi_screener" not in st.session_state:
+        st.session_state.vadm_multi_screener = None
+
+    multi_files = st.file_uploader(
+        "Screener Excel files (select multiple)", type=["xlsx"],
+        accept_multiple_files=True, key="multi_screener_upload"
+    )
+
+    if multi_files:
+        symbol_filepath_pairs = []
+        for f in multi_files:
+            sym = f.name.rsplit(".", 1)[0].upper()
+            temp_path = f"/tmp/_multi_{sym}.xlsx"
+            with open(temp_path, "wb") as out:
+                out.write(f.getbuffer())
+            symbol_filepath_pairs.append((sym, temp_path))
+
+        batch_result = parse_multiple_screener_excels(symbol_filepath_pairs)
+        st.session_state.vadm_multi_screener = batch_result
+
+    if st.session_state.vadm_multi_screener is not None:
+        batch = st.session_state.vadm_multi_screener
+        st.success(f"{len(batch['parsed'])} stocks parsed: {list(batch['parsed'].keys())}")
+        if batch["failures"]:
+            st.warning(f"Failed to parse: {batch['failures']}")
 
     st.divider()
     st.subheader("Sector Mapping Setup")
