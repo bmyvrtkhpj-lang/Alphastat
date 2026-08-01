@@ -688,13 +688,20 @@ with tab_black:
 
     if st.button("Fetch Sector Mapping (Live NSE)"):
         try:
-            result = build_sector_mapping(CANDIDATE_SECTORAL_INDICES)
+            with st.spinner(
+                "Fetching from NSE - now retries up to 3x per index with a 45s "
+                "timeout (NSE can be slow to respond to cloud IPs), so this may "
+                "take a few minutes for all 15 indices..."
+            ):
+                result = build_sector_mapping(CANDIDATE_SECTORAL_INDICES)
             st.session_state.vadm_sector_mapping = result
         except Exception as e:
             st.error(
-                f"Fetch failed: {e}. If this is an auth/connection error, the "
-                f"deployed app's network to nseindia.com may be blocked or rate-limited - "
-                f"try again in a moment."
+                f"Fetch failed even after retries: {e}. This is a stronger signal "
+                f"NSE may be deliberately rate-limiting/blocking Streamlit Cloud's "
+                f"IP range specifically, not just a transient timeout - retries "
+                f"alone won't fix that. Check the failures list below for which "
+                f"specific indices failed."
             )
 
     if st.session_state.vadm_sector_mapping is not None:
