@@ -45,6 +45,7 @@ from vadm_calculations import (
     summarize_backtest_signals,
     build_signal_markers,
     build_sector_mapping,
+    build_sector_mapping_yfinance,
     CANDIDATE_SECTORAL_INDICES,
     calc_delivery_score_D,
     calc_valuation_score_V_selfrelative,
@@ -703,6 +704,21 @@ with tab_black:
                 f"alone won't fix that. Check the failures list below for which "
                 f"specific indices failed."
             )
+
+    st.caption(
+        "⚠️ Fallback below - yfinance's sector field has a documented history "
+        "of silently breaking (GitHub issues, 2022-2025). Cheap to test on "
+        "your actual stocks, not confirmed reliable - see what happens."
+    )
+    if st.button("Try Sector Mapping via yfinance (fallback)"):
+        uploaded_symbols = (
+            list(st.session_state.vadm_multi_screener["parsed"].keys())
+            if st.session_state.get("vadm_multi_screener") else None
+        )
+        test_symbols = uploaded_symbols or ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ITC"]
+        with st.spinner(f"Trying yfinance for: {test_symbols}..."):
+            result = build_sector_mapping_yfinance(test_symbols)
+        st.session_state.vadm_sector_mapping = result
 
     if st.session_state.vadm_sector_mapping is not None:
         mapping_result = st.session_state.vadm_sector_mapping
