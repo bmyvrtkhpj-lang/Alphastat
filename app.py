@@ -43,6 +43,13 @@ from vadm_calculations import (
     run_alpha_white_backtest,
     summarize_backtest_signals,
     build_signal_markers,
+    build_sector_mapping,
+    CANDIDATE_SECTORAL_INDICES,
+    calc_delivery_score_D,
+    calc_valuation_score_V_selfrelative,
+    calc_quadrant,
+    test_vadm_t_hypotheses,
+    build_quadrant_markers,
 )
 
 from lightweight_charts_v5 import lightweight_charts_v5_component
@@ -500,21 +507,177 @@ with tab_white:
 
 
 # ---------------------------------------------------------------------------
-# TAB: ALPHA BLACK - stub only. No formula/H4 to build against yet.
+# TAB: ALPHA BLACK - VADM_t, universal for whichever stock is searched above.
 # ---------------------------------------------------------------------------
 with tab_black:
     st.header("Alpha Black")
-    st.warning(
-        "Not built yet, on purpose. VADM_t's functional form f() and H4 have "
-        "never been specified - your own project memory flags this as a "
-        "CEO-level decision. What IS ready below: the delivery-flow data "
-        "H2 depends on, computed and displayed, waiting for the formula "
-        "that will consume it."
+    st.info(
+        "**VADM_t = Beta_1·V + Beta_2·D + Beta_3·(V×D)**. Everything below runs "
+        "for whichever stock you searched above - not hardcoded to one stock. "
+        "V uses a self-relative fallback (vs its own history) since true "
+        "sector-relative V still needs live sector mapping + peer EPS data "
+        "(see Sector Mapping below) - once that's set up, swap in "
+        "calc_valuation_score_V() for the sector-grouped version."
     )
-    if eod_df is not None:
-        dlv_pct = calc_delivery_pct(eod_df)
-        rel_dlv = calc_relative_delivery(eod_df, lookback=60, method="zscore")
-        st.line_chart(pd.DataFrame({
-            "Delivery %": dlv_pct.tail(120).values,
-            "Relative Delivery (z-score)": rel_dlv.tail(120).values,
-        }, index=eod_df["Date"].tail(120)))
+
+    st.subheader("Hypotheses")
+    st.markdown("""
+| | Hypothesis |
+|---|---|
+| **H1** | Low PE (Cheap) → higher forward returns |
+| **H2** | Rising delivery pressure (Accumulation) → higher forward returns |
+| **H3** | Interaction: Cheap+Accumulation together beats either alone |
+| **H4** *(proposed, your call)* | Expensive+Distribution → lowest forward returns, completing the quadrant symmetrically |
+""")
+
+    if eod_df is None:
+        st.warning("No price data loaded - pick a valid symbol above.")
+    elif not pe_series:
+        st.info("Upload the Screener Excel above (in Alpha White) to unlock V-score, "
+                 "quadrant classification, and hypothesis testing here - they need annual EPS.")
+    else:
+        # --- Financial ratios relevant to V ---
+        st.subheader("Financial Ratios (V-score inputs)")
+        v_df = calc_valuation_score_V_selfrelative(
+            eod_df, parsed["years"], parsed["price"], parsed["net_profit"], parsed["adjusted_shares_cr"]
+        )
+        latest_v_row = v_df.dropna(subset=["V"]).iloc[-1] if v_df["V"].notna().any() else None
+
+        fr1, fr2, fr3 = st.columns(3)
+        fr1.metric("Current PE (live)", f"{live_current_pe:.2f}" if live_current_pe else "N/A")
+        fr1.caption("Same live PE as Alpha White (CMP ÷ latest annual EPS)")
+        if latest_v_row is not None:
+            fr2.metric("V-score (self-relative)", f"{latest_v_row['V']:.3f}")
+            fr2.caption("0 = most expensive vs own history, 1 = cheapest")
+        else:
+            fr2.metric("V-score", "N/A - insufficient history")
+
+        D_today = calc_delivery_score_D(eod_df, lookback=20).iloc[-1]
+        fr3.metric("D-score (delivery, today)", f"{D_today:+.3f}" if pd.notna(D_today) else "N/A")
+        fr3.caption("Simple average of 2 z-scores - not pre-fit, per your robustness decision")
+
+        # --- Quadrant classification, today ---
+        st.subheader("Quadrant Classification (today)")
+        if latest_v_row is not None and pd.notna(D_today):
+            today_quadrant = calc_quadrant(latest_v_row["V"], D_today)
+            quadrant_colors = {
+                "Cheap_Accumulation": st.success, "Expensive_Distribution": st.error,
+                "Cheap_Distribution": st.warning, "Expensive_Accumulation": st.warning,
+            }
+            quadrant_colors.get(today_quadrant, st.info)(f"**{today_quadrant.replace('_', ' + ')}**")
+        else:
+            st.info("Not enough history yet to classify today's quadrant.")
+
+        st.divider()
+
+        # --- Hypothesis testing, button-driven, universal for this stock ---
+        st.subheader("Hypothesis Testing")
+        st.caption(
+            "Runs H1-H4 against this stock's actual history - real result for "
+            "THIS stock, not asserted as universally true across all stocks."
+        )
+
+        if "vadm_hypothesis_test" not in st.session_state:
+            st.session_state.vadm_hypothesis_test = None
+
+        forward_days_black = st.slider("Forward-return window for testing (days)", 5, 60, 20, key="black_fwd_days")
+
+        if st.button("Test Hypotheses (H1-H4)"):
+            test_result = test_vadm_t_hypotheses(
+                eod_df, parsed["years"], parsed["price"], parsed["net_profit"], parsed["adjusted_shares_cr"],
+                forward_days=forward_days_black,
+            )
+            st.session_state.vadm_hypothesis_test = test_result
+
+        quadrant_markers = []
+        if st.session_state.vadm_hypothesis_test is not None:
+            test_result = st.session_state.vadm_hypothesis_test
+            if "error" in test_result and not test_result.get("quadrant_stats"):
+                st.warning(test_result["error"])
+            else:
+                st.markdown(f"**{test_result['n_total']} clean trading days tested**")
+
+                qc1, qc2, qc3, qc4 = st.columns(4)
+                for col, qname in zip([qc1, qc2, qc3, qc4],
+                                       ["Cheap_Accumulation", "Cheap_Distribution",
+                                        "Expensive_Accumulation", "Expensive_Distribution"]):
+                    stats = test_result["quadrant_stats"].get(qname)
+                    if stats:
+                        col.metric(qname.replace("_", "+"), f"{stats['mean']:+.2f}%", f"n={int(stats['count'])}")
+                    else:
+                        col.metric(qname.replace("_", "+"), "N/A")
+
+                st.markdown("**Verdicts (real, on this stock's history):**")
+                for h, verdict in test_result["verdicts"].items():
+                    (st.success if verdict == "HOLDS" else st.error)(f"{h}: **{verdict}**")
+
+                quadrant_markers = build_quadrant_markers(test_result["detail_df"])
+
+        st.divider()
+
+        # --- Chart with quadrant signals ---
+        st.subheader("Chart")
+        st.caption("C+A markers = Cheap+Accumulation (H1-H3 predicted best). "
+                    "E+D markers = Expensive+Distribution (H4 predicted worst). "
+                    "Run 'Test Hypotheses' above to populate markers.")
+
+        chart_df_black = eod_df.rename(columns={
+            "Date": "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume",
+        }).copy()
+        chart_df_black["date"] = chart_df_black["date"].dt.strftime("%Y-%m-%d")
+        chart_df_black = chart_df_black.replace({np.nan: None})
+
+        black_price_indicator = PriceIndicator(
+            chart_df_black, height=400, title=f"{symbol} - VADM_t", style="Candlestick",
+            markers=quadrant_markers,
+        )
+        black_price_indicator.calculate()
+
+        lightweight_charts_v5_component(
+            name=f"{symbol}_black", charts=[black_price_indicator.pane()], height=400,
+            key=f"black_chart_{symbol}",
+        )
+
+    st.divider()
+    st.subheader("Sector Mapping Setup")
+    st.caption(
+        "Click to fetch live from NSE - runs on Streamlit Cloud when deployed, "
+        "no local code needed. Uses NSE's own sectoral indices as sector "
+        "labels (your choice, revisiting the earlier idea)."
+    )
+
+    if "vadm_sector_mapping" not in st.session_state:
+        st.session_state.vadm_sector_mapping = None
+
+    if st.button("Fetch Sector Mapping (Live NSE)"):
+        try:
+            result = build_sector_mapping(CANDIDATE_SECTORAL_INDICES)
+            st.session_state.vadm_sector_mapping = result
+        except Exception as e:
+            st.error(
+                f"Fetch failed: {e}. If this is an auth/connection error, the "
+                f"deployed app's network to nseindia.com may be blocked or rate-limited - "
+                f"try again in a moment."
+            )
+
+    if st.session_state.vadm_sector_mapping is not None:
+        mapping_result = st.session_state.vadm_sector_mapping
+        mapping = mapping_result["mapping"]
+        failures = mapping_result["failures"]
+
+        mc1, mc2 = st.columns(2)
+        mc1.metric("Symbols mapped", len(mapping))
+        mc2.metric("Sectors covered", len(set(mapping.values())))
+
+        if failures:
+            st.warning(f"{len(failures)} index(es) failed to fetch: {failures}")
+
+        if mapping:
+            preview_df = pd.DataFrame(
+                [{"Symbol": s, "Sector": sec} for s, sec in mapping.items()]
+            ).sort_values(["Sector", "Symbol"])
+            st.dataframe(preview_df, use_container_width=True, height=300)
+            st.caption(
+                "This mapping is now available for V-score building once you "
+                "also upload multiple stocks' Screener Excel files per sector."
+            )
