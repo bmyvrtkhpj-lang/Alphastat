@@ -51,6 +51,7 @@ from vadm_calculations import (
     calc_valuation_score_V_selfrelative,
     calc_quadrant,
     test_vadm_t_hypotheses,
+    test_vadm_t_hypotheses_pooled,
     build_quadrant_markers,
 )
 
@@ -675,6 +676,59 @@ with tab_black:
         st.success(f"{len(batch['parsed'])} stocks parsed: {list(batch['parsed'].keys())}")
         if batch["failures"]:
             st.warning(f"Failed to parse: {batch['failures']}")
+
+        st.markdown("**Pooled Hypothesis Test** - built after IRB and INFY gave "
+                     "genuinely contradicting H2/H3 verdicts on their own; pooling "
+                     "these uploaded stocks gives a less noisy read than any single stock.")
+
+        if "vadm_pooled_hypothesis" not in st.session_state:
+            st.session_state.vadm_pooled_hypothesis = None
+
+        if st.button("Run Pooled Hypothesis Test (uploaded stocks)"):
+            stock_configs = []
+            fetch_failures = []
+            for sym, parsed_data in batch["parsed"].items():
+                try:
+                    sym_eod_df = load_eod2_data(sym)
+                    stock_configs.append({
+                        "symbol": sym, "eod_df": sym_eod_df, "fy_dates": parsed_data["years"],
+                        "fy_price": parsed_data["price"], "fy_net_profit": parsed_data["net_profit"],
+                        "fy_adj_shares": parsed_data["adjusted_shares_cr"],
+                    })
+                except Exception as e:
+                    fetch_failures.append((sym, str(e)))
+
+            if stock_configs:
+                fwd_days = st.session_state.get("black_fwd_days", 20)  # safe fallback -
+                # forward_days_black is only defined when a stock+excel are
+                # already loaded above; this section can run independently of that.
+                pooled_result = test_vadm_t_hypotheses_pooled(stock_configs, forward_days=fwd_days)
+                pooled_result["eod_fetch_failures"] = fetch_failures
+                st.session_state.vadm_pooled_hypothesis = pooled_result
+            else:
+                st.error(f"Couldn't fetch EOD2 data for any uploaded stock: {fetch_failures}")
+
+        if st.session_state.vadm_pooled_hypothesis is not None:
+            pr = st.session_state.vadm_pooled_hypothesis
+            if "error" in pr:
+                st.warning(pr["error"])
+            else:
+                st.markdown(f"**{pr['n_stocks']} stocks pooled, {pr['n_total']} total rows** "
+                             f"(per stock: {pr['per_stock_n']})")
+                if pr.get("eod_fetch_failures"):
+                    st.warning(f"Couldn't fetch price data for: {pr['eod_fetch_failures']}")
+
+                pqc1, pqc2, pqc3, pqc4 = st.columns(4)
+                for col, qname in zip([pqc1, pqc2, pqc3, pqc4],
+                                       ["Cheap_Accumulation", "Cheap_Distribution",
+                                        "Expensive_Accumulation", "Expensive_Distribution"]):
+                    stats = pr["quadrant_stats"].get(qname)
+                    if stats:
+                        col.metric(qname.replace("_", "+"), f"{stats['mean']:+.2f}%", f"n={int(stats['count'])}")
+
+                st.markdown("**Pooled verdicts:**")
+                for h, verdict in pr["verdicts"].items():
+                    (st.success if verdict == "HOLDS" else st.error)(f"{h}: **{verdict}**")
 
     st.divider()
     st.subheader("Sector Mapping Setup")
