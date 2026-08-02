@@ -1666,6 +1666,84 @@ def test_vadm_t_hypotheses(eod_df: pd.DataFrame, fy_dates: list, fy_price: list,
     }
 
 
+def test_vadm_t_hypotheses_pooled(stock_configs: list, delivery_lookback: int = 20,
+                                   valuation_lookback: int = 252, forward_days: int = 20,
+                                   reporting_lag_days: int = 60) -> dict:
+    """
+    POOLED version of test_vadm_t_hypotheses - built after IRB and INFY gave
+    genuinely CONTRADICTING results for H2/H3 (H2/H3 held for IRB, failed
+    for INFY - Cheap+Distribution actually beat Cheap+Accumulation on INFY).
+    That's real evidence single-stock verdicts aren't reliable on their own -
+    this pools multiple stocks together for a less noisy read.
+
+    stock_configs: list of dicts, one per stock, each with keys:
+      symbol, eod_df, fy_dates, fy_price, fy_net_profit, fy_adj_shares
+    (same shape as grid_search_alpha_white_thresholds' stock_configs)
+
+    Pools every stock's classified (quadrant, forward_return) rows together
+    before computing quadrant averages and verdicts - one stock's
+    idiosyncrasy can't dominate the result the way it did testing IRB or
+    INFY alone.
+    """
+    all_rows = []
+    failures = []
+
+    for config in stock_configs:
+        try:
+            result = test_vadm_t_hypotheses(
+                config["eod_df"], config["fy_dates"], config["fy_price"],
+                config["fy_net_profit"], config["fy_adj_shares"],
+                delivery_lookback=delivery_lookback, valuation_lookback=valuation_lookback,
+                forward_days=forward_days, reporting_lag_days=reporting_lag_days,
+            )
+            if "detail_df" in result and not result["detail_df"].empty:
+                piece = result["detail_df"].copy()
+                piece["symbol"] = config["symbol"]
+                all_rows.append(piece)
+        except Exception as e:
+            failures.append((config.get("symbol", "?"), str(e)))
+
+    if not all_rows:
+        return {"error": "No usable data from any stock in stock_configs.", "failures": failures}
+
+    pooled = pd.concat(all_rows, ignore_index=True)
+    quadrant_stats = pooled.groupby("quadrant")["forward_return"].agg(["mean", "count"]).to_dict("index")
+
+    def _get_mean(q):
+        return quadrant_stats.get(q, {}).get("mean")
+
+    cheap_mean = pooled[pooled["V"] > 0.5]["forward_return"].mean()
+    expensive_mean = pooled[pooled["V"] <= 0.5]["forward_return"].mean()
+    accum_mean = pooled[pooled["D"] > 0]["forward_return"].mean()
+    dist_mean = pooled[pooled["D"] <= 0]["forward_return"].mean()
+    cheap_accum = _get_mean("Cheap_Accumulation")
+    expensive_dist = _get_mean("Expensive_Distribution")
+
+    verdicts = {
+        "H1 (Cheap > Expensive)": "HOLDS" if (cheap_mean is not None and expensive_mean is not None
+                                               and cheap_mean > expensive_mean) else "DOES NOT HOLD",
+        "H2 (Accumulation > Distribution)": "HOLDS" if (accum_mean is not None and dist_mean is not None
+                                                          and accum_mean > dist_mean) else "DOES NOT HOLD",
+        "H3 (Cheap+Accum beats independent effects)": (
+            "HOLDS" if (cheap_accum is not None and cheap_mean is not None and accum_mean is not None
+                        and cheap_accum > max(cheap_mean, accum_mean)) else "DOES NOT HOLD"
+        ),
+        "H4 (Expensive+Distribution is worst quadrant)": (
+            "HOLDS" if (expensive_dist is not None and quadrant_stats
+                        and expensive_dist == min(v["mean"] for v in quadrant_stats.values())) else "DOES NOT HOLD"
+        ),
+    }
+
+    return {
+        "quadrant_stats": quadrant_stats,
+        "verdicts": verdicts,
+        "n_total": len(pooled),
+        "n_stocks": pooled["symbol"].nunique(),
+        "per_stock_n": pooled.groupby("symbol").size().to_dict(),
+        "failures": failures,
+    }
+
+
 # ---------------------------------------------------------------------------
 # STILL OPEN - NOT BUILT, NOT GUESSED:
 #
